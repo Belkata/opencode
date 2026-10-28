@@ -99,10 +99,9 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   }
 
   const events = createOpenCodeEventSource()
-  const reconnect = server.type === "plugin" || server.type === "sidecar" ? server.reconnect : undefined
 
   const connection = createClientConnection(transport.api, {
-    reconnect: reconnect ? async (signal) => transport.update(await reconnect(signal)) : undefined,
+    reconnect: eventStreamReconnect(server, transport),
     flushInterval: 16,
     pageLifecycle: true,
     onEvent(event) {
@@ -111,7 +110,8 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     log: {
       info(message, data) {
         if (message !== "event stream disconnected") return
-        console.info("[global-sdk] event stream disconnected", { url: transport.url, managed: !!reconnect, ...data })
+        const managed = (server.type === "plugin" || server.type === "sidecar") && !!server.reconnect
+        console.info("[global-sdk] event stream disconnected", { url: transport.url, managed, ...data })
       },
     },
   })
@@ -135,6 +135,26 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     connection,
     event: events.event,
   }
+}
+
+/**
+ * How the event stream resolves its server again after a disconnect. The stream keeps the API it last resolved, so
+ * an endpoint that changes underneath it must come back through here. A plugin's server can be created from the
+ * plugin's last inventory, on a placeholder endpoint, before the plugin reports the real one (and its `reconnect`,
+ * if any); the transport follows the endpoint, so plugin servers always resolve, reading `reconnect` at each call.
+ */
+export function eventStreamReconnect(
+  server: ServerConnection.Any,
+  transport: Pick<ServerTransport, "api" | "update">,
+): ((signal: AbortSignal) => Promise<ServerApi>) | undefined {
+  if (server.type === "plugin")
+    return async (signal) => {
+      const reconnect = server.reconnect
+      return reconnect ? transport.update(await reconnect(signal)) : transport.api
+    }
+  if (server.type !== "sidecar" || !server.reconnect) return undefined
+  const reconnect = server.reconnect
+  return async (signal) => transport.update(await reconnect(signal))
 }
 
 /** A server's HTTP and PTY clients, rebuilt when its endpoint changes. */

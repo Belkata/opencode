@@ -1,7 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import type { OpenCodeEvent } from "@opencode/client/promise"
 import { createRoot } from "solid-js"
-import { createOpenCodeEventSource, createServerTransport } from "./client"
+import { createOpenCodeEventSource, createServerTransport, eventStreamReconnect } from "./client"
+import type { ServerConnection } from "./registry"
 
 const permission = {
   id: "evt_permission",
@@ -130,4 +131,45 @@ test("rotates HTTP and PTY clients together", async () => {
       authorization: `Basic ${btoa("opencode:second")}`,
     },
   ])
+})
+
+test("event stream follows a plugin server's endpoint once the plugin reports it", async () => {
+  // A plugin server restored from the last inventory starts on a placeholder, without `reconnect`.
+  const entry: { http: ServerConnection.HttpBase; reconnect?: ServerConnection.Plugin["reconnect"] } = {
+    http: { url: "http://127.0.0.1:0" },
+  }
+  const server = {
+    type: "plugin",
+    get http() {
+      return entry.http
+    },
+    get reconnect() {
+      return entry.reconnect
+    },
+  } as unknown as ServerConnection.Any
+  const urls: string[] = []
+  const fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const request = input instanceof Request ? input : new Request(input, init)
+    urls.push(request.url)
+    return Response.json({ version: "2.0.0-test", pid: 1, urls: [request.url], paths: { tmp: "/tmp/opencode" } })
+  }) as typeof globalThis.fetch
+  const transport = createServerTransport({ http: server.http, fetch })
+  const reconnect = eventStreamReconnect(server, transport)
+  if (!reconnect) throw new Error("plugin servers resolve their endpoint again")
+
+  // The plugin reports its endpoint; the app's effect moves the transport there.
+  entry.http = { url: "http://localhost.:4101", password: "secret" }
+  transport.update(server.http)
+  await (await reconnect(new AbortController().signal)).server.info()
+
+  // A plugin that reports `reconnect` later is asked at the next disconnect.
+  entry.reconnect = async () => ({ url: "http://localhost.:4102", password: "secret" })
+  await (await reconnect(new AbortController().signal)).server.info()
+
+  expect(urls).toEqual(["http://localhost.:4101/api/info", "http://localhost.:4102/api/info"])
+})
+
+test("event stream of a server without reconnect keeps its endpoint", () => {
+  const server = { type: "http", http: { url: "http://127.0.0.1:4096" } } as unknown as ServerConnection.Any
+  expect(eventStreamReconnect(server, createServerTransport({ http: server.http }))).toBeUndefined()
 })
